@@ -1,12 +1,10 @@
+
 struct BVHNode {
     float3 bbox_min;
     float3 bbox_max;
 
-    // which BVH node we should skip
-    // to if this node is totally not
-    // intersecting the ray
-    // if next_index < 0, then we don't
-    // have the next node to skip to
+    // Which BVH node we should skip to
+    // if this node is not intersecting.
     int next_index;
 
     uint triangle_begin;
@@ -82,8 +80,209 @@ void detect_collision(uint tid : SV_DispatchThreadID,
                       uniform uint num_bvh_nodes,
                       uniform float collision_distance,
                       uniform float contact_margin) {
+
     if (tid >= num_particles) {
         return;
     }
-    // TODO: HW 4.6. Your code below.
+
+    float3 pos = positions[tid];
+
+    // Maximum distance at which we consider a contact.
+    float contact_threshold = contact_margin + collision_distance;
+
+    // Track the closest signed distance and its contact plane.
+    float min_dist = contact_threshold;
+    float4 best_contact = float4(0.0, 0.0, 0.0, 0.0);
+
+    // --------------------------------------------------
+    // Part 1: Check plane colliders.
+    // --------------------------------------------------
+
+    for (uint i = 0; i < num_planes; i++) {
+        float4 plane = planes[i];
+
+        float3 n = plane.xyz;
+        float d = plane.w;
+
+        float signed_dist = dot(n, pos) - d;
+
+        if (signed_dist < min_dist) {
+            min_dist = signed_dist;
+            best_contact = plane;
+        }
+    }
+
+    // --------------------------------------------------
+    // Part 2: Check sphere colliders.
+    // --------------------------------------------------
+
+    for (uint i = 0; i < num_spheres; i++) {
+        float4 sphere = spheres[i];
+
+        float3 center = sphere.xyz;
+        float radius = sphere.w;
+
+        float3 direction = pos - center;
+        float dist = length(direction);
+
+        float signed_dist = dist - radius;
+
+        if (signed_dist < min_dist) {
+            min_dist = signed_dist;
+
+            // Calculate the outward-facing sphere normal.
+            float3 n;
+
+            if (dist > 1e-6) {
+                n = direction / dist;
+            } else {
+                n = float3(0.0, 1.0, 0.0);
+            }
+
+            // Tangent plane at the closest point on the sphere.
+            float d = dot(n, center) + radius;
+
+            best_contact = float4(n, d);
+        }
+    }
+
+    // --------------------------------------------------
+    // Part 3: Find the closest triangle using the BVH.
+    // --------------------------------------------------
+
+    // The minimum unsigned distance to a triangle.
+    float min_mesh_dist = contact_threshold;
+
+    // Store the closest point and its triangle's normal.
+    float3 closest_position = float3(0.0, 0.0, 0.0);
+    float3 closest_normal = float3(0.0, 0.0, 0.0);
+
+    bool found_triangle = false;
+
+    // Stackless BVH traversal starts at the root.
+    uint node_index = 0;
+
+    while (node_index < num_bvh_nodes) {
+
+        BVHNode node = bvh_nodes[node_index];
+
+        // Calculate the distance from the particle to this node's AABB.
+        float bbox_dist = point_aabb_distance(
+            pos,
+            node.bbox_min,
+            node.bbox_max
+        );
+
+        // If the bounding box is too far away, skip its subtree.
+        if (bbox_dist > min_mesh_dist) {
+
+            if (node.next_index < 0) {
+                break;
+            }
+
+            node_index = uint(node.next_index);
+            continue;
+        }
+
+        // If this is a leaf, check its triangles.
+        if (node.is_leaf) {
+
+            for (uint j = node.triangle_begin;
+                 j < node.triangle_end;
+                 j++) {
+
+                uint3 tri = mesh_triangles[j];
+
+                float3 p0 = mesh_vertices[tri.x];
+                float3 p1 = mesh_vertices[tri.y];
+                float3 p2 = mesh_vertices[tri.z];
+
+                // Find the closest point on this triangle.
+                ClosestPoint cp = closest_point_triangle(
+                    pos, p0, p1, p2
+                );
+
+                float dist = length(pos - cp.position);
+
+                // Keep the closest triangle found so far.
+                if (dist < min_mesh_dist) {
+
+                    min_mesh_dist = dist;
+                    closest_position = cp.position;
+
+                    // Calculate the geometric face normal.
+                    float3 ng = normalize(
+                        cross(p1 - p0, p2 - p0)
+                    );
+
+                    // Interpolate the vertex normals using barycentric
+                    // coordinates from the closest point.
+                    float3 n0 = mesh_vertex_normals[tri.x];
+                    float3 n1 = mesh_vertex_normals[tri.y];
+                    float3 n2 = mesh_vertex_normals[tri.z];
+
+                    float3 ns = normalize(
+                        cp.bary.x * n0 +
+                        cp.bary.y * n1 +
+                        cp.bary.z * n2
+                    );
+
+                    // Make the geometric normal point in the same
+                    // direction as the interpolated vertex normal.
+                    if (dot(ng, ns) < 0.0) {
+                        ng = -ng;
+                    }
+
+                    closest_normal = ng;
+                    found_triangle = true;
+                }
+            }
+        }
+
+        // Move to the next node in preorder traversal.
+        node_index++;
+    }
+
+    // --------------------------------------------------
+    // Part 4: Convert the closest triangle into a contact plane.
+    // --------------------------------------------------
+
+    if (found_triangle) {
+
+        // Treat the closest triangle as an infinite plane.
+        float signed_dist = dot(
+            closest_normal,
+            pos - closest_position
+        );
+
+        if (signed_dist < min_dist) {
+
+            min_dist = signed_dist;
+
+            float d = dot(
+                closest_normal,
+                closest_position
+            );
+
+            best_contact = float4(closest_normal, d);
+        }
+    }
+
+    // --------------------------------------------------
+    // Part 5: Save the contact plane.
+    // --------------------------------------------------
+
+    if (min_dist < contact_threshold) {
+
+        // Shift the contact plane outward by collision_distance.
+        best_contact.w += collision_distance;
+
+        contact_planes[tid] = best_contact;
+
+    } else {
+
+        // No collision.
+        contact_planes[tid] = float4(0.0, 0.0, 0.0, 0.0);
+    }
 }
+
